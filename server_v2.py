@@ -1,110 +1,541 @@
 #!/usr/bin/env python3
 """
-Pedestrian Slow-Pass Flow Analysis Server v2
+Nuclear Facility Pedestrian Density Prediction Server v2
 - Watches three folders: raw images / BEV images / scene graph JSONs
 - Matches files by stem (000000.jpg <-> 000000_intersection.png <-> 000000_scene_graph.json)
 - Serves real-time analysis via REST API
 - Pure Python stdlib, no extra dependencies
-Run: python3 server.py --images ./images --bev ./bev --graphs ./graphs [--port 8765]
+Run: python server_v2.py --images ./images --bev ./bev --graphs ./graphs [--port 8765]
 """
 
-import json, sys, os, re, time, threading, argparse, mimetypes, base64
+import json, time, threading, argparse, mimetypes, base64
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 from pathlib import Path
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SPI Engine (same logic as v1)
+# Nuclear Facility Flow Density Engine
 # ─────────────────────────────────────────────────────────────────────────────
 
-VEHICLE_WEIGHT = {
-    "TRUCK": 1.4, "BUS": 1.4, "CAR": 1.0,
-    "VAN": 1.1, "MOTORCYCLIST": 0.6, "CYCLIST": 0.4, "PEDESTRIAN": 0.0,
+LEVEL_COLOR = {"SAFE":"#1D9E75","CAUTION":"#1F73B7","SLOW":"#BA7517","STOP":"#E24B4A"}
+LEVEL_BG    = {"SAFE":"#EAF3DE","CAUTION":"#E6F1FB","SLOW":"#FAEEDA","STOP":"#FCEBEB"}
+LEVEL_NAME  = {"SAFE":"正常", "CAUTION":"关注", "SLOW":"限流", "STOP":"停入"}
+
+PERSON_TYPES = {
+    "PERSON", "PEDESTRIAN", "WORKER", "STAFF", "EMPLOYEE", "VISITOR",
+    "CONTRACTOR", "OPERATOR", "GUARD", "RESPONDER", "TECHNICIAN",
 }
-LEVEL_COLOR = {"SAFE":"#1D9E75","CAUTION":"#0F6E56","SLOW":"#BA7517","STOP":"#E24B4A"}
-LEVEL_BG    = {"SAFE":"#EAF3DE","CAUTION":"#E1F5EE","SLOW":"#FAEEDA","STOP":"#FCEBEB"}
 
-def layer1(map_triples):
-    cw = {}
-    for t in map_triples:
-        if t.get("object_type") == "CROSSWALK" and t.get("state") == "inside":
-            cid = t["object"]; vt = t.get("subject_type","CAR")
-            r = t.get("inter_ratio", 0.0); w = VEHICLE_WEIGHT.get(vt, 1.0)
-            cw.setdefault(cid, {"occupants":[], "raw":0.0})
-            sc = r * w
-            cw[cid]["occupants"].append({"id":t["subject"],"type":vt,"inter_ratio":round(r,3),"weight":w,"contribution":round(sc,3)})
-            cw[cid]["raw"] += sc
-    total = 0.0; details = []
-    for cid, d in cw.items():
-        norm = min(d["raw"]/1.4,1.0)*100; total += norm
-        details.append({"crosswalk_id":cid,"occupants":d["occupants"],"raw_score":round(d["raw"],3),"normalized_score":round(norm,1)})
-    score = (total/len(cw)) if cw else 0.0
-    
-    for t in map_triples:
-        if t.get("object_type") == "CROSSWALK" and t.get("state") == "inside":
-            vt = t.get("subject_type", "CAR")
-            if vt == "PEDESTRIAN":   # ← 新增：跳过行人
-                continue
+DEFAULT_WEIGHTS = (0.35, 0.25, 0.25, 0.15)
+DEFAULT_HORIZON_MINUTES = 5.0
 
-    return {"score":round(min(score,100),1),"crosswalk_count":len(cw),"details":details}
+ZONE_RULES = {
+    "REACTOR":          {"label":"反应堆厂房", "area":36.0, "target":0.16, "limit":0.38, "weight":1.60},
+    "RADIATION":        {"label":"辐射控制区", "area":32.0, "target":0.18, "limit":0.45, "weight":1.50},
+    "CONTROLLED":       {"label":"受控区",     "area":45.0, "target":0.25, "limit":0.60, "weight":1.30},
+    "ACCESS_GATE":      {"label":"门禁/闸机",  "area":10.0, "target":0.40, "limit":1.00, "weight":1.25},
+    "DECON":            {"label":"去污/监测点", "area":14.0, "target":0.22, "limit":0.55, "weight":1.45},
+    "EVACUATION_ROUTE": {"label":"疏散通道",   "area":24.0, "target":0.28, "limit":0.70, "weight":1.35},
+    "EXIT":             {"label":"安全出口",   "area":12.0, "target":0.35, "limit":0.90, "weight":1.35},
+    "STAIR":            {"label":"楼梯间",     "area":14.0, "target":0.28, "limit":0.70, "weight":1.35},
+    "MUSTER":           {"label":"集合点",     "area":120.0,"target":0.70, "limit":1.60, "weight":0.80},
+    "CORRIDOR":         {"label":"通道",       "area":24.0, "target":0.35, "limit":0.85, "weight":1.00},
+    "CONTROL_ROOM":     {"label":"主控/值守区", "area":28.0, "target":0.20, "limit":0.50, "weight":1.35},
+    "GENERAL":          {"label":"普通作业区", "area":60.0, "target":0.45, "limit":1.10, "weight":0.90},
+}
 
-   
+HIGHER_PRIORITY_ZONE = {
+    "REACTOR": 90, "RADIATION": 80, "CONTROL_ROOM": 75, "DECON": 70,
+    "CONTROLLED": 65, "EVACUATION_ROUTE": 60, "EXIT": 58, "STAIR": 55,
+    "ACCESS_GATE": 50, "CORRIDOR": 35, "MUSTER": 25, "GENERAL": 10,
+}
 
-def layer2(map_triples):
-    vehicles = []
-    for t in map_triples:
-        meta = t.get("object_meta",{})
-        if meta.get("is_intersection") and t.get("inter_ratio",0)>0.5 and t.get("subject_type")!="PEDESTRIAN":
-            vehicles.append({"id":t["subject"],"type":t.get("subject_type"),"inter_ratio":round(t.get("inter_ratio",0),3),"lane_id":t.get("object","")})
-    count = len(vehicles)
-    return {"score":round(min(count/6.0*100,100),1),"vehicle_count":count,"vehicles":vehicles}
+def _norm(value, default=""):
+    if value is None:
+        return default
+    return str(value).strip().upper().replace("-", "_").replace(" ", "_")
 
-def layer3(map_triples, obj_triples):
-    cw_veh = {t["subject"] for t in map_triples if t.get("object_type")=="CROSSWALK"}
-    chains = []; conflict = 0
+def _as_float(value, default=0.0):
+    try:
+        if value is None or value == "":
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+def _as_bool(value, default=False):
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    return str(value).strip().lower() in {"1", "true", "yes", "y", "是", "已授权", "authorized"}
+
+def _clamp(value, low=0.0, high=100.0):
+    return max(low, min(high, value))
+
+def _pick_number(*values, default=None):
+    for value in values:
+        if value is None or value == "":
+            continue
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            continue
+    return default
+
+def _is_person(subject_type):
+    st = _norm(subject_type)
+    return st in PERSON_TYPES or any(token in st for token in ("PERSON", "WORKER", "STAFF", "PEDESTRIAN"))
+
+def _meta_dict(value):
+    return value if isinstance(value, dict) else {}
+
+def _state_is_present(state):
+    return _norm(state).lower() in {"inside", "in", "on", "at", "near", "queued", "waiting", "entering", "exiting", ""}
+
+def _infer_zone_type(raw_type="", zone_id="", meta=None):
+    meta = _meta_dict(meta)
+    candidates = [
+        meta.get("zone_type"), meta.get("area_type"), meta.get("facility_zone"),
+        meta.get("safety_zone"), raw_type, zone_id,
+    ]
+    text = " ".join(_norm(c) for c in candidates if c)
+
+    if _as_bool(meta.get("is_reactor_building")) or "REACTOR" in text or "反应堆" in text:
+        return "REACTOR"
+    if _as_bool(meta.get("is_radiation_area")) or _as_bool(meta.get("radiation_controlled")) or "RADIATION" in text or "RAD" in text or "辐射" in text:
+        return "RADIATION"
+    if _as_bool(meta.get("is_control_room")) or "CONTROL_ROOM" in text or "主控" in text:
+        return "CONTROL_ROOM"
+    if _as_bool(meta.get("is_decon")) or "DECON" in text or "MONITOR" in text or "去污" in text or "监测" in text:
+        return "DECON"
+    if _as_bool(meta.get("is_evacuation_route")) or _as_bool(meta.get("evacuation_route")) or "EVAC" in text or "疏散" in text:
+        return "EVACUATION_ROUTE"
+    if _as_bool(meta.get("is_exit")) or "EXIT" in text or "出口" in text:
+        return "EXIT"
+    if "STAIR" in text or "楼梯" in text:
+        return "STAIR"
+    if _as_bool(meta.get("is_access_gate")) or "GATE" in text or "ACCESS" in text or "AIRLOCK" in text or "门禁" in text or "闸机" in text or "气闸" in text:
+        return "ACCESS_GATE"
+    if _as_bool(meta.get("is_muster")) or "MUSTER" in text or "ASSEMBLY" in text or "集合" in text:
+        return "MUSTER"
+    if "CORRIDOR" in text or "PASSAGE" in text or "HALLWAY" in text or "通道" in text or "走廊" in text:
+        return "CORRIDOR"
+    if _as_bool(meta.get("is_controlled")) or _as_bool(meta.get("restricted")) or "CONTROLLED" in text or "RESTRICTED" in text or "受控" in text:
+        return "CONTROLLED"
+    if any(token in text for token in ("ZONE", "AREA", "ROOM", "WORKSHOP", "BUILDING", "厂房", "区域", "车间", "房间")):
+        return "GENERAL"
+    return "GENERAL"
+
+def _rule(zone_type):
+    return ZONE_RULES.get(zone_type, ZONE_RULES["GENERAL"])
+
+def _new_zone(zone_id, zone_type="GENERAL", meta=None):
+    meta = dict(_meta_dict(meta))
+    zone_type = zone_type or "GENERAL"
+    rule = _rule(zone_type)
+    return {
+        "id": str(zone_id),
+        "zone_type": zone_type,
+        "label": meta.get("label") or meta.get("name") or rule["label"],
+        "meta": meta,
+        "persons": {},
+        "unauthorized": set(),
+        "missing_dosimeter": set(),
+        "blocked": _as_bool(meta.get("blocked")),
+        "opposite_flow": _as_bool(meta.get("opposite_flow")),
+        "queue_count": _pick_number(meta.get("queue_count"), meta.get("waiting_count"), default=0.0) or 0.0,
+    }
+
+def _merge_zone_type(current, incoming):
+    if HIGHER_PRIORITY_ZONE.get(incoming, 0) > HIGHER_PRIORITY_ZONE.get(current, 0):
+        return incoming
+    return current
+
+def _top_level_zones(sg):
+    zones = []
+    for key in ("zones", "areas", "facility_zones", "regions"):
+        value = sg.get(key)
+        if isinstance(value, list):
+            zones.extend(item for item in value if isinstance(item, dict))
+    return zones
+
+def collect_zones(sg):
+    zones = {}
+
+    for item in _top_level_zones(sg):
+        zid = item.get("id") or item.get("zone_id") or item.get("name") or item.get("label")
+        if not zid:
+            continue
+        ztype = _infer_zone_type(item.get("type") or item.get("object_type"), zid, item)
+        zones[str(zid)] = _new_zone(zid, ztype, item)
+
+    for t in sg.get("object_map_triples", []):
+        if not isinstance(t, dict):
+            continue
+        meta = dict(_meta_dict(t.get("object_meta")))
+        zid = t.get("object") or meta.get("id") or meta.get("name")
+        if not zid:
+            continue
+        ztype = _infer_zone_type(t.get("object_type"), zid, meta)
+        zone = zones.setdefault(str(zid), _new_zone(zid, ztype, meta))
+        zone["zone_type"] = _merge_zone_type(zone["zone_type"], ztype)
+        zone["label"] = meta.get("label") or meta.get("name") or zone["label"]
+        zone["meta"].update(meta)
+        zone["blocked"] = zone["blocked"] or _as_bool(meta.get("blocked")) or _norm(t.get("state")) == "BLOCKED"
+        zone["opposite_flow"] = zone["opposite_flow"] or _as_bool(meta.get("opposite_flow"))
+        zone["queue_count"] = max(zone["queue_count"], _pick_number(meta.get("queue_count"), t.get("queue_count"), default=0.0) or 0.0)
+
+        if _is_person(t.get("subject_type")) and _state_is_present(t.get("state")):
+            sid = str(t.get("subject") or f"person_{len(zone['persons']) + 1}")
+            ratio = _as_float(t.get("inter_ratio"), 1.0)
+            contribution = _clamp(ratio if ratio > 0 else 1.0, 0.05, 1.0)
+            zone["persons"][sid] = max(zone["persons"].get(sid, 0.0), contribution)
+            smeta = _meta_dict(t.get("subject_meta"))
+            authorized = smeta.get("authorized", t.get("authorized"))
+            if authorized is False or str(authorized).strip().lower() in {"false", "0", "no", "未授权"}:
+                zone["unauthorized"].add(sid)
+            dosimeter = smeta.get("dosimeter", smeta.get("has_dosimeter", t.get("has_dosimeter")))
+            if dosimeter is False or str(dosimeter).strip().lower() in {"false", "0", "no", "未佩戴"}:
+                zone["missing_dosimeter"].add(sid)
+
+    return list(zones.values())
+
+def _scene_context(sg):
+    meta = {}
+    for key in ("scene_meta", "metadata", "facility_meta", "context"):
+        if isinstance(sg.get(key), dict):
+            meta.update(sg[key])
+    alarm = _norm(meta.get("alarm_state") or meta.get("emergency_level") or sg.get("alarm_state") or "NORMAL")
+    phase = _norm(meta.get("operation_phase") or meta.get("plant_mode") or sg.get("operation_phase") or "NORMAL")
+    shift_change = _as_bool(meta.get("shift_change") or sg.get("shift_change"))
+    horizon = _pick_number(meta.get("horizon_minutes"), sg.get("horizon_minutes"), default=DEFAULT_HORIZON_MINUTES)
+    return {"meta": meta, "alarm": alarm, "phase": phase, "shift_change": shift_change, "horizon_minutes": max(1.0, horizon)}
+
+def _event_surge(zone_type, context):
+    alarm = context["alarm"]
+    phase = context["phase"]
+    shift_change = context["shift_change"]
+    surge = 0.0
+
+    if alarm in {"ALERT", "SITE_AREA_EMERGENCY", "GENERAL_EMERGENCY", "EMERGENCY", "EVACUATION"}:
+        if zone_type in {"EVACUATION_ROUTE", "EXIT", "STAIR", "DECON", "MUSTER", "ACCESS_GATE"}:
+            surge += 0.35
+        elif zone_type in {"REACTOR", "RADIATION", "CONTROLLED", "CONTROL_ROOM"}:
+            surge -= 0.20
+    if shift_change:
+        if zone_type in {"ACCESS_GATE", "CORRIDOR", "GENERAL", "EXIT", "STAIR"}:
+            surge += 0.18
+        elif zone_type in {"CONTROLLED", "RADIATION"}:
+            surge += 0.08
+    if phase in {"OUTAGE", "REFUELING", "MAINTENANCE", "检修", "换料"}:
+        if zone_type in {"CONTROLLED", "RADIATION", "REACTOR", "DECON", "ACCESS_GATE"}:
+            surge += 0.15
+    return surge
+
+def _zone_numbers(zone, context):
+    meta = zone["meta"]
+    ztype = zone["zone_type"]
+    rule = _rule(ztype)
+
+    current_count = _pick_number(
+        meta.get("current_count"), meta.get("person_count"), meta.get("count"), meta.get("occupancy"),
+        default=None,
+    )
+    if current_count is None:
+        current_count = sum(zone["persons"].values())
+    current_count = max(0.0, current_count)
+
+    area_m2 = _pick_number(meta.get("area_m2"), meta.get("area"), meta.get("size_m2"), default=rule["area"])
+    area_m2 = max(1.0, area_m2)
+
+    incoming = _pick_number(meta.get("incoming_rate_ppm"), meta.get("inflow_ppm"), meta.get("entry_rate_ppm"), default=0.0) or 0.0
+    outgoing = _pick_number(meta.get("outgoing_rate_ppm"), meta.get("outflow_ppm"), meta.get("exit_rate_ppm"), default=0.0) or 0.0
+    horizon = context["horizon_minutes"]
+    surge_count = current_count * _event_surge(ztype, context)
+    projected_count = max(0.0, current_count + (incoming - outgoing) * horizon + surge_count)
+
+    density = _pick_number(meta.get("density"), meta.get("density_pm2"), default=current_count / area_m2)
+    predicted_density = _pick_number(meta.get("predicted_density"), meta.get("forecast_density"), default=projected_count / area_m2)
+
+    target_density = _pick_number(meta.get("target_density"), meta.get("target_density_pm2"), default=rule["target"])
+    limit_density = _pick_number(meta.get("limit_density"), meta.get("max_density"), meta.get("capacity_density"), default=rule["limit"])
+    limit_density = max(limit_density, target_density + 0.01)
+
+    capacity_people = _pick_number(meta.get("capacity"), meta.get("capacity_people"), default=area_m2 * limit_density)
+    target_people = area_m2 * target_density
+    utilization = projected_count / max(capacity_people, 1.0)
+
+    base_score = _clamp((predicted_density - target_density) / (limit_density - target_density) * 100.0)
+    modifiers = 0.0
+    if zone["blocked"]:
+        modifiers += 18.0
+    if zone["opposite_flow"]:
+        modifiers += 10.0
+    if zone["queue_count"] > max(3.0, target_people * 0.40):
+        modifiers += min(20.0, zone["queue_count"] * 1.5)
+    if zone["unauthorized"]:
+        modifiers += min(30.0, 12.0 * len(zone["unauthorized"]))
+    if zone["missing_dosimeter"] and ztype in {"RADIATION", "REACTOR", "CONTROLLED"}:
+        modifiers += min(20.0, 8.0 * len(zone["missing_dosimeter"]))
+
+    weighted_score = _clamp(base_score * rule["weight"] + modifiers)
+
+    if predicted_density >= limit_density:
+        status = "OVER_LIMIT"
+    elif predicted_density >= target_density:
+        status = "HIGH"
+    elif predicted_density >= target_density * 0.65:
+        status = "NORMAL"
+    else:
+        status = "LOW"
+
+    return {
+        "zone_id": zone["id"],
+        "zone_type": ztype,
+        "zone_label": zone["label"],
+        "current_count": round(current_count, 1),
+        "predicted_count": round(projected_count, 1),
+        "area_m2": round(area_m2, 1),
+        "density": round(density, 3),
+        "predicted_density": round(predicted_density, 3),
+        "target_density": round(target_density, 3),
+        "limit_density": round(limit_density, 3),
+        "capacity_people": round(capacity_people, 1),
+        "utilization": round(min(utilization, 9.99), 3),
+        "queue_count": round(zone["queue_count"], 1),
+        "unauthorized_count": len(zone["unauthorized"]),
+        "missing_dosimeter_count": len(zone["missing_dosimeter"]),
+        "blocked": zone["blocked"],
+        "opposite_flow": zone["opposite_flow"],
+        "score": round(weighted_score, 1),
+        "status": status,
+    }
+
+def _score_from_details(details):
+    if not details:
+        return 0.0
+    scores = [d["score"] for d in details]
+    mean_score = sum(scores) / len(scores)
+    top_scores = sorted(scores, reverse=True)[:3]
+    top_mean = sum(top_scores) / len(top_scores)
+    return round(_clamp(max(scores) * 0.45 + top_mean * 0.35 + mean_score * 0.20), 1)
+
+def layer1_density(zones, context):
+    details = sorted((_zone_numbers(z, context) for z in zones), key=lambda x: x["score"], reverse=True)
+    total_area = sum(d["area_m2"] for d in details) or 1.0
+    current_people = sum(d["current_count"] for d in details)
+    predicted_people = sum(d["predicted_count"] for d in details)
+    return {
+        "score": _score_from_details(details),
+        "zone_count": len(details),
+        "current_people": round(current_people, 1),
+        "predicted_people": round(predicted_people, 1),
+        "avg_density": round(current_people / total_area, 3),
+        "predicted_avg_density": round(predicted_people / total_area, 3),
+        "peak_density": round(max((d["predicted_density"] for d in details), default=0.0), 3),
+        "details": details,
+    }
+
+def layer2_access_control(zones, context):
+    relevant_types = {"ACCESS_GATE", "CONTROLLED", "RADIATION", "REACTOR", "CONTROL_ROOM", "DECON"}
+    details = []
+    for zone in zones:
+        if zone["zone_type"] not in relevant_types and not zone["unauthorized"]:
+            continue
+        d = _zone_numbers(zone, context)
+        access_score = d["score"] * 0.55
+        access_score += min(35.0, d["unauthorized_count"] * 14.0)
+        access_score += min(20.0, d["missing_dosimeter_count"] * 8.0)
+        access_score += min(25.0, d["queue_count"] * 1.2)
+        d["score"] = round(_clamp(access_score), 1)
+        details.append(d)
+    details.sort(key=lambda x: x["score"], reverse=True)
+    return {
+        "score": _score_from_details(details),
+        "controlled_zone_count": len(details),
+        "unauthorized_total": sum(d["unauthorized_count"] for d in details),
+        "missing_dosimeter_total": sum(d["missing_dosimeter_count"] for d in details),
+        "gate_queue_total": round(sum(d["queue_count"] for d in details if d["zone_type"] in {"ACCESS_GATE", "DECON"}), 1),
+        "details": details,
+    }
+
+def layer3_evacuation(zones, obj_triples, context):
+    evac_types = {"EVACUATION_ROUTE", "EXIT", "STAIR", "DECON", "MUSTER", "CORRIDOR", "ACCESS_GATE"}
+    details = []
+    for zone in zones:
+        if zone["zone_type"] in evac_types or _as_bool(zone["meta"].get("evacuation_route")):
+            d = _zone_numbers(zone, context)
+            evac_score = d["score"] * 0.75
+            if d["blocked"]:
+                evac_score += 20.0
+            if d["opposite_flow"]:
+                evac_score += 12.0
+            if d["utilization"] > 0.85:
+                evac_score += 12.0
+            d["score"] = round(_clamp(evac_score), 1)
+            details.append(d)
+
+    behavior_events = []
+    event_score = 0.0
+    risky_relations = {"blocking", "blocked_by", "stopped", "standing", "opposite_direction", "counterflow", "gathering", "queued", "queueing", "converging"}
     for t in obj_triples:
-        if t.get("relation")=="following":
-            risk = t["object"] in cw_veh
-            if risk: conflict += 35
-            chains.append({"follower":t["subject"],"leader":t["object"],"risk":risk})
-    total = min(conflict + min(len(obj_triples)*10,40), 100)
-    return {"score":round(total,1),"following_chains":chains,"crosswalk_blocking_vehicles":list(cw_veh),"chain_count":len(chains)}
+        if not isinstance(t, dict):
+            continue
+        relation = str(t.get("relation", "")).strip().lower()
+        if relation in risky_relations:
+            severity = 18.0 if relation in {"blocking", "blocked_by", "stopped"} else 10.0
+            event_score += severity
+            behavior_events.append({
+                "subject": t.get("subject"),
+                "relation": relation,
+                "object": t.get("object"),
+                "severity": round(severity, 1),
+            })
 
-def classify(spi):
-    if spi < 25: return "SAFE"
-    if spi < 50: return "CAUTION"
-    if spi < 75: return "SLOW"
+    base = _score_from_details(details)
+    score = round(_clamp(base * 0.75 + min(event_score, 60.0) * 0.25), 1)
+    details.sort(key=lambda x: x["score"], reverse=True)
+    return {
+        "score": score,
+        "route_count": len(details),
+        "blocked_route_count": sum(1 for d in details if d["blocked"]),
+        "opposite_flow_count": sum(1 for d in details if d["opposite_flow"]),
+        "behavior_event_count": len(behavior_events),
+        "bottlenecks": details,
+        "behavior_events": behavior_events[:20],
+    }
+
+def layer4_radiation_operation(zones, context):
+    details = []
+    alarm = context["alarm"]
+    phase = context["phase"]
+    phase_score = 0.0
+    if alarm in {"ALERT", "SITE_AREA_EMERGENCY", "GENERAL_EMERGENCY", "EMERGENCY", "EVACUATION"}:
+        phase_score += 45.0
+    elif alarm not in {"", "NORMAL", "NONE"}:
+        phase_score += 20.0
+    if phase in {"OUTAGE", "REFUELING", "MAINTENANCE", "检修", "换料"}:
+        phase_score += 18.0
+
+    for zone in zones:
+        meta = zone["meta"]
+        ztype = zone["zone_type"]
+        if ztype not in {"REACTOR", "RADIATION", "CONTROLLED", "DECON"} and not _as_bool(meta.get("contamination_alarm")):
+            continue
+        d = _zone_numbers(zone, context)
+        ref = _pick_number(meta.get("dose_rate_reference_usv_h"), default=25.0)
+        dose = _pick_number(meta.get("dose_rate_usv_h"), meta.get("dose_rate"), default=0.0) or 0.0
+        dose_score = _clamp(dose / max(ref, 0.1) * 100.0)
+        contamination = _as_bool(meta.get("contamination_alarm") or meta.get("contaminated"))
+        rad_score = d["score"] * 0.35 + dose_score * 0.45 + (25.0 if contamination else 0.0)
+        d.update({
+            "dose_rate_usv_h": round(dose, 3),
+            "dose_reference_usv_h": round(ref, 3),
+            "contamination_alarm": contamination,
+            "score": round(_clamp(rad_score), 1),
+        })
+        details.append(d)
+
+    base = _score_from_details(details)
+    score = round(_clamp(base * 0.70 + phase_score * 0.30), 1)
+    details.sort(key=lambda x: x["score"], reverse=True)
+    return {
+        "score": score,
+        "alarm_state": alarm or "NORMAL",
+        "operation_phase": phase or "NORMAL",
+        "shift_change": context["shift_change"],
+        "radiation_zone_count": len(details),
+        "details": details,
+    }
+
+def classify(index):
+    if index < 25:
+        return "SAFE"
+    if index < 50:
+        return "CAUTION"
+    if index < 75:
+        return "SLOW"
     return "STOP"
 
-def advisory(level, l1, l2, l3):
-    base = {"SAFE":"行人可正常通过斑马线，当前路口车辆稀少且无车辆压线。",
-            "CAUTION":"行人请注意观察，路口存在少量车辆，建议确认车辆停稳后通过。",
-            "SLOW":"行人需缓行通过，斑马线存在车辆占用或路口排队明显，请确认安全后谨慎通行。",
-            "STOP":"行人请勿通过！斑马线被车辆占用或路口严重拥堵，等待路况好转。"}[level]
-  # advisory 函数里，只报告真正的障碍车辆
-    extras = [
-        f"车辆{o['id']}({o['type']})占据斑马线{o['inter_ratio']*100:.0f}%"
-        for d in l1.get("details",[])
-        for o in d.get("occupants",[])
-        if o["inter_ratio"] > 0.3
-        and o["type"] not in ("PEDESTRIAN", "CYCLIST")  # ← 新增过滤
-    ]
-    risky = [c for c in l3.get("following_chains",[]) if c.get("risk")]
-    if risky: extras.append(f"{len(risky)}辆车排队驶向斑马线区域")
-    if extras: base += " 风险：" + "；".join(extras[:3]) + "。"
+def advisory(level, l1, l2, l3, l4):
+    base = {
+        "SAFE": "预测期内人流密度处于正常受控范围，可按当前门禁和巡检节奏运行。",
+        "CAUTION": "预测期内存在局部人流升高，建议关注门禁、通道和受控区人员变化。",
+        "SLOW": "预测期内可能形成拥堵或受控区聚集，建议启动分批放行并加强现场引导。",
+        "STOP": "预测期内人流风险较高，建议暂停向高风险区域放行，优先疏散通道和门禁瓶颈。",
+    }[level]
+
+    extras = []
+    hot = (l1.get("details") or [])[:1]
+    if hot:
+        z = hot[0]
+        extras.append(f"{z['zone_label']}({z['zone_id']})预测密度{z['predicted_density']}人/㎡")
+    if l2.get("unauthorized_total"):
+        extras.append(f"受控区发现{l2['unauthorized_total']}个未授权/异常准入记录")
+    if l3.get("blocked_route_count"):
+        extras.append(f"{l3['blocked_route_count']}条疏散相关路径存在阻塞")
+    if l4.get("alarm_state") not in {"", "NORMAL", "NONE"}:
+        extras.append(f"当前报警状态为{l4['alarm_state']}")
+    if extras:
+        base += " 重点：" + "；".join(extras[:4]) + "。"
     return base
 
-def analyze(sg, weights=(0.5,0.3,0.2)):
-    mt = sg.get("object_map_triples",[])
-    ot = sg.get("object_object_triples",[])
-    l1r = layer1(mt); l2r = layer2(mt); l3r = layer3(mt, ot)
-    spi = round(min(l1r["score"]*weights[0]+l2r["score"]*weights[1]+l3r["score"]*weights[2],100),1)
-    lv  = classify(spi)
-    return {"image_id":sg.get("image_id","?"),"spi":spi,"level":lv,
-            "level_color":LEVEL_COLOR[lv],"level_bg":LEVEL_BG[lv],
-            "advisory":advisory(lv,l1r,l2r,l3r),
-            "layers":{"layer1_crosswalk_occupancy":l1r,"layer2_intersection_density":l2r,"layer3_vehicle_behavior":l3r},
-            "weights":{"layer1":weights[0],"layer2":weights[1],"layer3":weights[2]}}
+def _normalize_weights(weights):
+    if not weights:
+        return DEFAULT_WEIGHTS
+    try:
+        vals = [float(x) for x in weights]
+    except (TypeError, ValueError):
+        return DEFAULT_WEIGHTS
+    while len(vals) < 4:
+        vals.append(DEFAULT_WEIGHTS[len(vals)])
+    vals = vals[:4]
+    total = sum(max(v, 0.0) for v in vals)
+    if total <= 0:
+        return DEFAULT_WEIGHTS
+    return tuple(max(v, 0.0) / total for v in vals)
+
+def analyze(sg, weights=DEFAULT_WEIGHTS):
+    context = _scene_context(sg)
+    zones = collect_zones(sg)
+    mt = sg.get("object_map_triples", [])
+    ot = sg.get("object_object_triples", [])
+    if not zones and mt:
+        # Keep empty or legacy road graphs from crashing; they simply score as no facility occupancy.
+        zones = []
+
+    l1r = layer1_density(zones, context)
+    l2r = layer2_access_control(zones, context)
+    l3r = layer3_evacuation(zones, ot, context)
+    l4r = layer4_radiation_operation(zones, context)
+    w = _normalize_weights(weights)
+    density_index = round(_clamp(l1r["score"] * w[0] + l2r["score"] * w[1] + l3r["score"] * w[2] + l4r["score"] * w[3]), 1)
+    lv = classify(density_index)
+    return {
+        "image_id": sg.get("image_id", "?"),
+        "metric": "NFDI",
+        "metric_name": "核工厂人流密度预测指数",
+        "horizon_minutes": context["horizon_minutes"],
+        "spi": density_index,  # Backward compatible with the original frontend/list API.
+        "density_index": density_index,
+        "predicted_density": l1r["predicted_avg_density"],
+        "peak_density": l1r["peak_density"],
+        "level": lv,
+        "level_name": LEVEL_NAME[lv],
+        "level_color": LEVEL_COLOR[lv],
+        "level_bg": LEVEL_BG[lv],
+        "advisory": advisory(lv, l1r, l2r, l3r, l4r),
+        "layers": {
+            "layer1_zone_density": l1r,
+            "layer2_access_control": l2r,
+            "layer3_evacuation_route": l3r,
+            "layer4_radiation_operation": l4r,
+        },
+        "weights": {"layer1": w[0], "layer2": w[1], "layer3": w[2], "layer4": w[3]},
+    }
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Folder Watcher — scans three directories and matches files by stem ID
@@ -304,6 +735,8 @@ class Handler(BaseHTTPRequestHandler):
                     "has_bev":   entry["bev_path"]   is not None,
                     "has_graph": entry["graph_path"]  is not None,
                     "spi":       r["spi"]   if r else None,
+                    "density_index": r["density_index"] if r else None,
+                    "metric":    r["metric"] if r else None,
                     "level":     r["level"] if r else None,
                     "level_color": r["level_color"] if r else None,
                     "error":     entry.get("error"),
@@ -356,7 +789,7 @@ class Handler(BaseHTTPRequestHandler):
             sg = body.get("scene_graph")
             if not sg:
                 self.send_json({"error":"Missing scene_graph"},400); return
-            w = body.get("weights", [0.5, 0.3, 0.2])
+            w = body.get("weights", DEFAULT_WEIGHTS)
             self.send_json(analyze(sg, tuple(w)))
 
         else:
@@ -367,7 +800,7 @@ class Handler(BaseHTTPRequestHandler):
 # ─────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    ap = argparse.ArgumentParser(description="Pedestrian SPI Server v2")
+    ap = argparse.ArgumentParser(description="Nuclear Facility Pedestrian Density Prediction Server v2")
     ap.add_argument("--images",  default=None, help="Path to raw images folder")
     ap.add_argument("--bev",     default=None, help="Path to BEV images folder")
     ap.add_argument("--graphs",  default=None, help="Path to scene graph JSON folder")
@@ -382,7 +815,7 @@ if __name__ == "__main__":
     time.sleep(0.5)
 
     server = HTTPServer(("0.0.0.0", args.port), Handler)
-    print(f"\n Pedestrian SPI Engine v2  →  http://localhost:{args.port}")
+    print(f"\n Nuclear Facility Density Engine v2  →  http://localhost:{args.port}")
     print(f"   Images dir : {args.images or '(not set)'}")
     print(f"   BEV dir    : {args.bev    or '(not set)'}")
     print(f"   Graphs dir : {args.graphs or '(not set)'}")

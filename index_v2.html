@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>行人缓行通过流 · 实时分析系统</title>
+<title>行人流密度预测 · 实时分析系统</title>
 <style>
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 :root{
@@ -105,10 +105,15 @@ input[type=text]:focus{border-color:var(--border2)}
 
 /* ── Layer bars ── */
 .lbar{display:flex;align-items:center;gap:8px;margin-bottom:6px}
-.lbar-label{width:130px;font-size:12px;color:var(--text2);flex-shrink:0}
+.lbar-label{width:150px;font-size:12px;color:var(--text2);flex-shrink:0}
 .lbar-track{flex:1;height:5px;background:var(--surface2);border-radius:3px;overflow:hidden}
 .lbar-fill{height:100%;border-radius:3px;transition:width .5s cubic-bezier(.4,0,.2,1)}
 .lbar-val{width:32px;text-align:right;font-size:12px;color:var(--text2)}
+.metric-grid{display:grid;grid-template-columns:repeat(4,minmax(120px,1fr));gap:8px;margin-top:12px}
+.metric{background:var(--surface2);border:0.5px solid var(--border);border-radius:var(--rmd);padding:8px 10px}
+.metric-label{font-size:11px;color:var(--text3);line-height:1.3}
+.metric-value{font-size:16px;font-weight:500;color:var(--text);margin-top:2px}
+.metric-unit{font-size:11px;color:var(--text3);font-weight:400;margin-left:2px}
 
 /* ── Detail tables ── */
 .tabs{display:flex;gap:4px;margin-bottom:12px}
@@ -119,14 +124,25 @@ th{background:var(--surface2);padding:6px 10px;text-align:left;font-weight:500;c
 td{padding:6px 10px;border-bottom:0.5px solid var(--border);color:var(--text)}
 tr:last-child td{border-bottom:none}
 tr:hover td{background:var(--surface2)}
-.vtag{display:inline-block;padding:2px 6px;border-radius:3px;font-size:10px;font-weight:500}
+.vtag{display:inline-block;padding:2px 6px;border-radius:3px;font-size:10px;font-weight:500;white-space:nowrap}
 .vt-TRUCK{background:#FCEBEB;color:#A32D2D}
 .vt-CAR{background:#E6F1FB;color:#185FA5}
 .vt-VAN{background:#FAEEDA;color:#854F0B}
 .vt-MOTORCYCLIST,.vt-CYCLIST{background:#F1EFE8;color:#5F5E5A}
 .vt-BUS{background:#FBEAF0;color:#993556}
+.vt-REACTOR,.vt-RADIATION{background:#FCEBEB;color:#A32D2D}
+.vt-CONTROLLED,.vt-DECON,.vt-CONTROL_ROOM{background:#FAEEDA;color:#854F0B}
+.vt-EVACUATION_ROUTE,.vt-EXIT,.vt-STAIR{background:#E6F1FB;color:#185FA5}
+.vt-ACCESS_GATE{background:#FBEAF0;color:#993556}
+.vt-MUSTER,.vt-CORRIDOR,.vt-GENERAL{background:#EAF3DE;color:#1D9E75}
 .risk-y{color:#E24B4A;font-weight:500}
 .risk-n{color:var(--text3)}
+
+@media(max-width:900px){
+  .img-row{grid-template-columns:1fr}
+  .gauge-row{align-items:flex-start;flex-direction:column}
+  .metric-grid{grid-template-columns:repeat(2,minmax(0,1fr))}
+}
 
 /* ── Refresh indicator ── */
 .refresh-bar{height:2px;background:var(--blue);width:0;transition:none;position:fixed;top:0;left:0;z-index:100}
@@ -144,10 +160,10 @@ tr:hover td{background:var(--surface2)}
 
 <!-- Top bar -->
 <div class="topbar">
-  <div class="topbar-logo">🚶</div>
+  <div class="topbar-logo">NF</div>
   <div>
-    <span class="topbar h1" style="font-size:15px;font-weight:500">行人缓行通过流分析</span>
-    <span class="topbar-sub">实时文件夹监控模式</span>
+    <span class="topbar h1" style="font-size:15px;font-weight:500">行人流密度预测</span>
+    <span class="topbar-sub">实时文件夹监控模式 · NFDI</span>
   </div>
   <div class="topbar-right">
     <div style="font-size:11px;color:var(--text3)" id="scan-time"></div>
@@ -201,7 +217,7 @@ tr:hover td{background:var(--surface2)}
     <div class="empty-right">
       <div class="icon">🗂️</div>
       <div>选择左侧场景查看详情</div>
-      <div style="font-size:12px;margin-top:4px">配置三个文件夹路径后，系统将自动检测并分析所有匹配的场景</div>
+      <div style="font-size:12px;margin-top:4px">配置三个文件夹路径后，系统将自动检测并预测人流密度风险</div>
     </div>
   </div>
 </div>
@@ -300,11 +316,11 @@ async function refreshList() {
 }
 
 // ─── Level helpers ────────────────────────────────────────────────────────────
-const LEVEL_LABEL = {SAFE:"安全",CAUTION:"注意",SLOW:"缓行",STOP:"禁行"};
+const LEVEL_LABEL = {SAFE:"正常",CAUTION:"关注",SLOW:"限流",STOP:"停入"};
 const LEVEL_COLOR = {SAFE:"var(--safe)",CAUTION:"var(--caution)",SLOW:"var(--slow)",STOP:"var(--stop)"};
 const LEVEL_BG    = {SAFE:"var(--safe-bg)",CAUTION:"var(--caution-bg)",SLOW:"var(--slow-bg)",STOP:"var(--stop-bg)"};
 const LEVEL_BORDER= {SAFE:"var(--safe-border)",CAUTION:"var(--caution-border)",SLOW:"var(--slow-border)",STOP:"var(--stop-border)"};
-const LEVEL_FULL  = {SAFE:"安全通行",CAUTION:"注意观察",SLOW:"缓行通过",STOP:"禁止通行"};
+const LEVEL_FULL  = {SAFE:"正常受控",CAUTION:"重点关注",SLOW:"分批限流",STOP:"暂停进入"};
 
 // ─── Render list ──────────────────────────────────────────────────────────────
 function renderList() {
@@ -318,7 +334,8 @@ function renderList() {
 
   el.innerHTML = allItems.map(item => {
     const lv = item.level;
-    const chip = lv ? `<div class="spi-chip" style="background:${LEVEL_BG[lv]};color:${LEVEL_COLOR[lv]}">${LEVEL_LABEL[lv]}<br><span style="font-size:10px;opacity:.8">${item.spi}</span></div>` : `<div class="spi-chip" style="background:var(--surface2);color:var(--text3)">—</div>`;
+    const score = item.density_index ?? item.spi;
+    const chip = lv ? `<div class="spi-chip" style="background:${LEVEL_BG[lv]};color:${LEVEL_COLOR[lv]}">${LEVEL_LABEL[lv]}<br><span style="font-size:10px;opacity:.8">${score}</span></div>` : `<div class="spi-chip" style="background:var(--surface2);color:var(--text3)">—</div>`;
     const active = item.id === activeId ? " active" : "";
     return `<div class="file-item${active}" onclick="loadDetail('${item.id}')">
       <div class="file-icon-group">
@@ -328,7 +345,7 @@ function renderList() {
       </div>
       <div class="file-info">
         <div class="file-id">${item.id}</div>
-        <div class="file-meta">${[item.has_image?"IMG":"",item.has_bev?"BEV":"",item.has_graph?"JSON":""].filter(Boolean).join(" · ")||"无文件"}</div>
+        <div class="file-meta">${[item.has_image?"IMG":"",item.has_bev?"BEV":"",item.has_graph?"JSON":"",lv?"NFDI":""].filter(Boolean).join(" · ")||"无文件"}</div>
       </div>
       ${chip}
     </div>`;
@@ -372,9 +389,10 @@ function renderDetail(entry) {
   }
 
   const l  = r.layers;
-  const l1 = l.layer1_crosswalk_occupancy;
-  const l2 = l.layer2_intersection_density;
-  const l3 = l.layer3_vehicle_behavior;
+  const l1 = l.layer1_zone_density || {score:0,details:[],zone_count:0,current_people:0,predicted_people:0,predicted_avg_density:0,peak_density:0};
+  const l2 = l.layer2_access_control || {score:0,details:[],controlled_zone_count:0,unauthorized_total:0,missing_dosimeter_total:0,gate_queue_total:0};
+  const l3 = l.layer3_evacuation_route || {score:0,bottlenecks:[],route_count:0,blocked_route_count:0,opposite_flow_count:0,behavior_events:[]};
+  const l4 = l.layer4_radiation_operation || {score:0,details:[],alarm_state:"NORMAL",operation_phase:"NORMAL",radiation_zone_count:0};
   const lv = r.level;
 
   const barC = s => s<25?"var(--safe)":s<50?"var(--caution)":s<75?"var(--slow)":"var(--stop)";
@@ -383,25 +401,51 @@ function renderDetail(entry) {
   const imgSrc = entry.image_data || null;
   const bevSrc = entry.bev_data   || null;
 
-  // Crosswalk rows
-  let cwRows = l1.details.flatMap(cw=>cw.occupants
-  .filter(o => o.type !== "PEDESTRIAN" && o.type !== "CYCLIST")
-  .map(o=>`<tr>
-    <td>${o.id}</td><td><span class="vtag vt-${o.type}">${o.type}</span></td>
-    <td style="font-size:11px;color:var(--text3)">${cw.crosswalk_id}</td>
-    <td>${(o.inter_ratio*100).toFixed(0)}%</td>
-    <td>${o.contribution.toFixed(3)}</td>
-  </tr>`)).join("") || `<tr><td colspan="5" style="color:var(--text3);text-align:center;padding:12px">无车辆压斑马线</td></tr>`;
+  const zoneTag = z => `<span class="vtag vt-${z.zone_type}">${zoneLabel(z.zone_type)}</span>`;
+  const statusText = s => ({OVER_LIMIT:"超限",HIGH:"偏高",NORMAL:"正常",LOW:"偏低"}[s] || s || "正常");
+  const flagText = z => [
+    z.blocked ? "阻塞" : "",
+    z.opposite_flow ? "逆向" : "",
+    z.unauthorized_count ? `未授权${z.unauthorized_count}` : "",
+    z.missing_dosimeter_count ? `剂量计异常${z.missing_dosimeter_count}` : ""
+  ].filter(Boolean).join(" · ") || "无";
 
-  let intRows = l2.vehicles.slice(0,10).map(v=>`<tr>
-    <td>${v.id}</td><td><span class="vtag vt-${v.type}">${v.type}</span></td>
-    <td>${(v.inter_ratio*100).toFixed(0)}%</td>
-  </tr>`).join("") || `<tr><td colspan="3" style="color:var(--text3);text-align:center;padding:12px">路口无拥堵车辆</td></tr>`;
+  let densityRows = (l1.details||[]).map(z=>`<tr>
+    <td>${z.zone_label}<br><span style="font-size:11px;color:var(--text3)">${z.zone_id}</span></td>
+    <td>${zoneTag(z)}</td>
+    <td>${z.current_count}</td>
+    <td>${z.predicted_count}</td>
+    <td>${z.predicted_density}</td>
+    <td>${z.limit_density}</td>
+    <td class="${z.status==="OVER_LIMIT"?'risk-y':'risk-n'}">${statusText(z.status)}</td>
+  </tr>`).join("") || `<tr><td colspan="7" style="color:var(--text3);text-align:center;padding:12px">未检测到区域数据</td></tr>`;
 
-  let chainRows = l3.following_chains.map(c=>`<tr>
-    <td>${c.follower}</td><td style="color:var(--text3)">→</td><td>${c.leader}</td>
-    <td class="${c.risk?'risk-y':'risk-n'}">${c.risk?"⚠ 驶向斑马线":"正常"}</td>
-  </tr>`).join("") || `<tr><td colspan="4" style="color:var(--text3);text-align:center;padding:12px">无跟车记录</td></tr>`;
+  let accessRows = (l2.details||[]).map(z=>`<tr>
+    <td>${z.zone_label}<br><span style="font-size:11px;color:var(--text3)">${z.zone_id}</span></td>
+    <td>${zoneTag(z)}</td>
+    <td>${z.queue_count}</td>
+    <td>${z.unauthorized_count}</td>
+    <td>${z.missing_dosimeter_count}</td>
+    <td>${z.score}</td>
+  </tr>`).join("") || `<tr><td colspan="6" style="color:var(--text3);text-align:center;padding:12px">门禁与受控区无明显异常</td></tr>`;
+
+  let routeRows = (l3.bottlenecks||[]).map(z=>`<tr>
+    <td>${z.zone_label}<br><span style="font-size:11px;color:var(--text3)">${z.zone_id}</span></td>
+    <td>${zoneTag(z)}</td>
+    <td>${z.predicted_density}</td>
+    <td>${Math.round((z.utilization||0)*100)}%</td>
+    <td>${flagText(z)}</td>
+    <td>${z.score}</td>
+  </tr>`).join("") || `<tr><td colspan="6" style="color:var(--text3);text-align:center;padding:12px">疏散通道未形成瓶颈</td></tr>`;
+
+  let radiationRows = (l4.details||[]).map(z=>`<tr>
+    <td>${z.zone_label}<br><span style="font-size:11px;color:var(--text3)">${z.zone_id}</span></td>
+    <td>${zoneTag(z)}</td>
+    <td>${z.dose_rate_usv_h ?? 0}</td>
+    <td>${z.contamination_alarm ? "是" : "否"}</td>
+    <td>${z.predicted_density}</td>
+    <td>${z.score}</td>
+  </tr>`).join("") || `<tr><td colspan="6" style="color:var(--text3);text-align:center;padding:12px">无辐射运行修正区域</td></tr>`;
 
   panel.innerHTML = `
 
@@ -426,9 +470,9 @@ function renderDetail(entry) {
 
   <!-- Row 2: gauge + advisory -->
   <div class="card">
-    <div class="card-title">SPI 评分</div>
+    <div class="card-title">${r.metric || "NFDI"} 预测评分</div>
     <div class="gauge-row">
-      <div class="gauge-wrap">${buildGauge(r.spi, LEVEL_COLOR[lv])}</div>
+      <div class="gauge-wrap">${buildGauge(r.density_index ?? r.spi, LEVEL_COLOR[lv])}</div>
       <div class="gauge-info">
         <div class="level-badge" style="background:${LEVEL_BG[lv]};color:${LEVEL_COLOR[lv]}">
           <span class="level-dot2" style="background:${LEVEL_COLOR[lv]}"></span>
@@ -437,51 +481,89 @@ function renderDetail(entry) {
         <div class="advisory-box" style="background:${LEVEL_BG[lv]};color:${LEVEL_COLOR[lv]};border-color:${LEVEL_BORDER[lv]}">
           ${r.advisory}
         </div>
+        <div class="metric-grid">
+          ${metricBox("预测窗口", r.horizon_minutes || 5, "min")}
+          ${metricBox("当前人数", l1.current_people || 0, "人")}
+          ${metricBox("预测人数", l1.predicted_people || 0, "人")}
+          ${metricBox("峰值密度", r.peak_density ?? l1.peak_density ?? 0, "人/㎡")}
+        </div>
       </div>
     </div>
     <div style="margin-top:14px">
-      <div class="card-title" style="margin-bottom:8px">三层分项得分</div>
-      ${lbar("L1 斑马线占用 (50%)", l1.score, barC(l1.score))}
-      ${lbar("L2 路口密度 (30%)",   l2.score, barC(l2.score))}
-      ${lbar("L3 行车行为 (20%)",   l3.score, barC(l3.score))}
+      <div class="card-title" style="margin-bottom:8px">四层分项得分</div>
+      ${lbar("L1 区域密度 (35%)",   l1.score, barC(l1.score))}
+      ${lbar("L2 门禁受控 (25%)",   l2.score, barC(l2.score))}
+      ${lbar("L3 疏散通道 (25%)",   l3.score, barC(l3.score))}
+      ${lbar("L4 辐射运行 (15%)",   l4.score, barC(l4.score))}
     </div>
   </div>
 
   <!-- Row 3: detail tabs -->
   <div class="card">
     <div class="tabs">
-      <button class="tab active" onclick="switchTab(0,this)">斑马线占用</button>
-      <button class="tab" onclick="switchTab(1,this)">路口车辆</button>
-      <button class="tab" onclick="switchTab(2,this)">跟车行为</button>
-      <button class="tab" onclick="switchTab(3,this)">原始 JSON</button>
+      <button class="tab active" onclick="switchTab(0,this)">区域密度</button>
+      <button class="tab" onclick="switchTab(1,this)">门禁受控</button>
+      <button class="tab" onclick="switchTab(2,this)">疏散通道</button>
+      <button class="tab" onclick="switchTab(3,this)">辐射运行</button>
+      <button class="tab" onclick="switchTab(4,this)">结果 JSON</button>
     </div>
 
     <div id="tab-0">
       <div style="font-size:12px;color:var(--text2);margin-bottom:8px">
-        检测到 <strong>${l1.crosswalk_count}</strong> 个斑马线区域，得分 <strong>${l1.score}</strong>/100
+        检测到 <strong>${l1.zone_count}</strong> 个区域，平均预测密度 <strong>${l1.predicted_avg_density}</strong> 人/㎡，得分 <strong>${l1.score}</strong>/100
       </div>
-      <table><thead><tr><th>车辆ID</th><th>类型</th><th>斑马线</th><th>占用率</th><th>加权贡献</th></tr></thead>
-      <tbody>${cwRows}</tbody></table>
+      <table><thead><tr><th>区域</th><th>类型</th><th>当前人数</th><th>预测人数</th><th>预测密度</th><th>限值</th><th>状态</th></tr></thead>
+      <tbody>${densityRows}</tbody></table>
     </div>
     <div id="tab-1" style="display:none">
       <div style="font-size:12px;color:var(--text2);margin-bottom:8px">
-        路口内 <strong>${l2.vehicle_count}</strong> 辆车，得分 <strong>${l2.score}</strong>/100
+        覆盖 <strong>${l2.controlled_zone_count}</strong> 个门禁/受控区域，未授权 <strong>${l2.unauthorized_total}</strong>，剂量计异常 <strong>${l2.missing_dosimeter_total}</strong>
       </div>
-      <table><thead><tr><th>车辆ID</th><th>类型</th><th>占据比</th></tr></thead>
-      <tbody>${intRows}</tbody></table>
+      <table><thead><tr><th>区域</th><th>类型</th><th>排队</th><th>未授权</th><th>剂量计异常</th><th>得分</th></tr></thead>
+      <tbody>${accessRows}</tbody></table>
     </div>
     <div id="tab-2" style="display:none">
       <div style="font-size:12px;color:var(--text2);margin-bottom:8px">
-        <strong>${l3.chain_count}</strong> 条跟车链，得分 <strong>${l3.score}</strong>/100 ·
-        压线车辆：${l3.crosswalk_blocking_vehicles.join("、")||"无"}
+        覆盖 <strong>${l3.route_count}</strong> 条疏散相关路径，阻塞 <strong>${l3.blocked_route_count}</strong>，逆向流 <strong>${l3.opposite_flow_count}</strong>
       </div>
-      <table><thead><tr><th>跟随车</th><th></th><th>前车</th><th>风险</th></tr></thead>
-      <tbody>${chainRows}</tbody></table>
+      <table><thead><tr><th>区域</th><th>类型</th><th>预测密度</th><th>利用率</th><th>标记</th><th>得分</th></tr></thead>
+      <tbody>${routeRows}</tbody></table>
     </div>
     <div id="tab-3" style="display:none">
-      <pre style="font-size:11px;color:var(--text2);background:var(--surface2);padding:12px;border-radius:var(--rmd);overflow-x:auto;line-height:1.5;max-height:300px;overflow-y:auto">${JSON.stringify(r, null, 2)}</pre>
+      <div style="font-size:12px;color:var(--text2);margin-bottom:8px">
+        报警状态 <strong>${l4.alarm_state || "NORMAL"}</strong>，运行阶段 <strong>${l4.operation_phase || "NORMAL"}</strong>，覆盖 <strong>${l4.radiation_zone_count}</strong> 个辐射相关区域
+      </div>
+      <table><thead><tr><th>区域</th><th>类型</th><th>剂量率 uSv/h</th><th>污染报警</th><th>预测密度</th><th>得分</th></tr></thead>
+      <tbody>${radiationRows}</tbody></table>
+    </div>
+    <div id="tab-4" style="display:none">
+      <pre style="font-size:11px;color:var(--text2);background:var(--surface2);padding:12px;border-radius:var(--rmd);overflow-x:auto;line-height:1.5;max-height:300px;overflow-y:auto">${escapeHtml(JSON.stringify(r, null, 2))}</pre>
     </div>
   </div>`;
+}
+
+function metricBox(label, value, unit) {
+  return `<div class="metric">
+    <div class="metric-label">${label}</div>
+    <div class="metric-value">${value}<span class="metric-unit">${unit}</span></div>
+  </div>`;
+}
+
+function escapeHtml(text) {
+  return String(text)
+    .replaceAll("&","&amp;")
+    .replaceAll("<","&lt;")
+    .replaceAll(">","&gt;")
+    .replaceAll('"',"&quot;")
+    .replaceAll("'","&#39;");
+}
+
+function zoneLabel(type) {
+  return ({
+    REACTOR:"反应堆", RADIATION:"辐射区", CONTROLLED:"受控区", ACCESS_GATE:"门禁",
+    DECON:"去污点", EVACUATION_ROUTE:"疏散", EXIT:"出口", STAIR:"楼梯",
+    MUSTER:"集合点", CORRIDOR:"通道", CONTROL_ROOM:"主控", GENERAL:"普通区"
+  })[type] || type || "区域";
 }
 
 function lbar(label, score, color) {
@@ -493,7 +575,7 @@ function lbar(label, score, color) {
 }
 
 function switchTab(idx, btn) {
-  [0,1,2,3].forEach(i => {
+  [0,1,2,3,4].forEach(i => {
     const el = document.getElementById(`tab-${i}`);
     if(el) el.style.display = i===idx?"":"none";
   });
